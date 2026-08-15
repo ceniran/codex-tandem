@@ -18,6 +18,22 @@ on the same Linux host. Moving the whole `.codex` directory splits history and
 breaks continuity. Codex Tandem keeps one home and changes only `auth.json`
 between turns.
 
+## Who it is for
+
+Tandem is aimed at the middle ground:
+
+- one Plus subscription is occasionally too small;
+- a higher multi-seat or heavy-usage plan would be wasteful;
+- most activity is conversation, community participation, or light project
+  work rather than continuous high-volume coding;
+- two Plus accounts provide enough headroom, but losing the active session when
+  switching would ruin the experience.
+
+It is not a bulk-account manager, account-sharing system, quota bypass, or a
+way to use accounts you do not own or control. If you need many concurrent
+workers or sustained production throughput, a two-profile file switcher is the
+wrong tool.
+
 ## Requirements
 
 - Linux or macOS
@@ -91,6 +107,11 @@ encrypting them. Protect the host account and never commit `auth.json`.
 Codex Tandem 是一个只支持 A/B 两个账号的轻量切换器。它只切换
 `auth.json`，不会移动 `.codex` 中的 sessions、历史、配置、MCP 或 skills，
 所以切换后仍可沿用原来的 Codex 会话。
+
+它适合这样一档真实需求：单个 Plus 偶尔不够用，更高额度或多席位方案又
+明显浪费；平时主要聊天、参加社区活动，偶尔做一些代码工作，两个 Plus
+刚好够用。它不是批量账号管理器，也不适合需要大量并发或持续重度开发的
+场景。
 
 第一次使用时，先用账号 A 正常登录 Codex，再运行：
 
