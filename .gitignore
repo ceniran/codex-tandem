@@ -1,0 +1,12 @@
+node_modules/
+.DS_Store
+*.log
+coverage/
+
+# Never commit Codex credentials.
+auth.json
+account-a/
+account-b/
+current.json
+switching.json
+operation.lock

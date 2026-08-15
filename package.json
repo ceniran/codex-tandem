@@ -1,0 +1,23 @@
+{
+  "name": "codex-tandem",
+  "version": "0.1.0",
+  "description": "Two-account credential switching for Codex CLI without moving sessions or configuration.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "codex-tandem": "src/cli.js"
+  },
+  "scripts": {
+    "check": "node --check src/account-profiles.js && node --check src/cli.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "codex",
+    "openai",
+    "account-switcher",
+    "cli"
+  ]
+}
