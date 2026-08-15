@@ -1,0 +1,31 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+const home = process.env.CODEX_HOME;
+const args = process.argv.slice(2);
+if (!home) process.exit(2);
+
+if (args[0] === 'login' && args[1] === 'status') {
+  process.exit(fs.existsSync(path.join(home, 'auth.json')) ? 0 : 1);
+}
+
+if (args[0] === 'login') {
+  const label = process.env.FAKE_ACCOUNT_LABEL || 'B';
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  const authPath = path.join(home, 'auth.json');
+  fs.writeFileSync(authPath, JSON.stringify({
+    auth_mode: 'chatgpt',
+    tokens: {
+      access_token: `access-${label}-abcdefghijklmnopqrstuvwxyz`,
+      refresh_token: `refresh-${label}-abcdefghijklmnopqrstuvwxyz`,
+      id_token: `id-${label}-abcdefghijklmnopqrstuvwxyz`,
+      account_id: `account-${label}`
+    }
+  }), { mode: 0o600 });
+  process.exit(0);
+}
+
+process.exit(2);

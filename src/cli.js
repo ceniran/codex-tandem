@@ -9,8 +9,7 @@ const {
   CodexAccountProfiles,
   TandemError,
   normalizeProfileName,
-  readSecureAuth,
-  writeAtomic
+  readSecureAuth
 } = require('./account-profiles');
 
 const codexHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
@@ -32,22 +31,24 @@ function codexLoginStatus(home = codexHome) {
   }
 }
 
-function loginProfile(profile, profiles) {
+async function loginProfile(profile, profiles) {
   const target = normalizeProfileName(profile);
-  const loginHome = path.join(tandemHome, `login-${target.toLowerCase()}`);
-  fs.mkdirSync(loginHome, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(loginHome, 0o700); } catch (_) {}
-  const result = spawnSync(codexBin, ['login'], {
-    env: { ...process.env, CODEX_HOME: loginHome },
-    stdio: 'inherit'
-  });
-  if (result.error || result.status !== 0) {
-    throw new TandemError('login_failed', `Codex login failed for profile ${target}.`);
+  const loginHome = fs.mkdtempSync(path.join(tandemHome, `.login-${target.toLowerCase()}-`));
+  fs.chmodSync(loginHome, 0o700);
+  try {
+    const result = spawnSync(codexBin, ['login'], {
+      env: { ...process.env, CODEX_HOME: loginHome },
+      stdio: 'inherit'
+    });
+    if (result.error || result.status !== 0) {
+      throw new TandemError('login_failed', `Codex login failed for profile ${target}.`);
+    }
+    const auth = readSecureAuth(path.join(loginHome, 'auth.json'));
+    await profiles.storeProfile(target, auth);
+    return target;
+  } finally {
+    fs.rmSync(loginHome, { recursive: true, force: true });
   }
-  const auth = readSecureAuth(path.join(loginHome, 'auth.json'));
-  writeAtomic(profiles.profileAuthPath(target), auth);
-  fs.rmSync(loginHome, { recursive: true, force: true });
-  return target;
 }
 
 async function main(argv) {
@@ -64,6 +65,7 @@ async function main(argv) {
   });
 
   if (command === 'status') {
+    await profiles.recover();
     const status = profiles.status();
     process.stdout.write(`Current: ${status.current || 'not initialized'}\n`);
     for (const profile of ['A', 'B']) {
@@ -74,14 +76,14 @@ async function main(argv) {
   }
 
   if (command === 'init') {
-    const profile = profiles.importLiveAs(profileArgument);
+    const profile = await profiles.importLiveAs(profileArgument);
     codexLoginStatus();
     process.stdout.write(`Initialized profile ${profile}. Sessions and config remain in ${codexHome}.\n`);
     return;
   }
 
   if (command === 'login') {
-    const profile = loginProfile(profileArgument, profiles);
+    const profile = await loginProfile(profileArgument, profiles);
     process.stdout.write(`Profile ${profile} is ready. The active account was not changed.\n`);
     return;
   }
