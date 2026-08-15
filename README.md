@@ -93,11 +93,17 @@ the previous account if the retry fails.
 
 - Credentials remain local and are never printed by `status`.
 - Credential files and profile directories are forced to `0600` and `0700`.
+- Credential and metadata reads reject symbolic links, wrong owners, wrong
+  groups, and group/world-readable modes.
+- A cross-process lock covers the complete read, replace, validate, commit or
+  rollback transaction. Dead-process locks are reaped before journal recovery.
 - Replacement uses write + fsync + atomic rename.
 - An interrupted switch is recovered from a small transaction journal.
 - A target login is validated with `codex login status`; failure restores the
   original credential and active-profile marker.
 - Refresh-token changes made by Codex are saved back before switching away.
+- A delayed rollback carries a transaction ID and refuses to overwrite any
+  later successful switch.
 
 Like Codex CLI itself, Tandem stores credentials as local files rather than
 encrypting them. Protect the host account and never commit `auth.json`.

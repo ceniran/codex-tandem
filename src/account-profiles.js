@@ -3,9 +3,12 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 
 const PROFILE_NAMES = Object.freeze(['A', 'B']);
 const MAX_AUTH_BYTES = 5 * 1024 * 1024;
+const MAX_METADATA_BYTES = 64 * 1024;
+const INCOMPLETE_LOCK_GRACE_MS = 30_000;
 
 class TandemError extends Error {
   constructor(code, message = code) {
@@ -57,7 +60,29 @@ function validateAuthDocument(buffer) {
 
 function ensurePrivateDirectory(directory) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(directory, 0o700); } catch (_) {}
+  const stat = fs.lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new TandemError('path_unsafe', `Directory must not be a symbolic link: ${directory}`);
+  }
+  validateOwnerAndMode(stat, directory, true);
+}
+
+function validateOwnerAndMode(stat, filePath, directory = false) {
+  if (process.platform === 'win32') return;
+  const expectedUid = typeof process.geteuid === 'function' ? process.geteuid() : process.getuid?.();
+  const expectedGid = typeof process.getegid === 'function' ? process.getegid() : process.getgid?.();
+  if (expectedUid !== undefined && stat.uid !== expectedUid) {
+    throw new TandemError('path_owner', `Path must be owned by the current user: ${filePath}`);
+  }
+  if (expectedGid !== undefined && stat.gid !== expectedGid) {
+    throw new TandemError('path_group', `Path must use the current user's group: ${filePath}`);
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new TandemError(
+      directory ? 'directory_permissions' : 'file_permissions',
+      `${directory ? 'Directory' : 'File'} permissions must not grant group or world access: ${filePath}`
+    );
+  }
 }
 
 function fsyncDirectory(directory) {
@@ -100,22 +125,170 @@ function writeAtomic(filePath, buffer, mode = 0o600) {
   }
 }
 
-function readSecureAuth(filePath) {
-  let stat;
+function readSecureFile(filePath, { missingCode = 'file_missing', maxBytes = MAX_METADATA_BYTES } = {}) {
+  let linkStat;
   try {
-    stat = fs.statSync(filePath);
+    linkStat = fs.lstatSync(filePath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw new TandemError(missingCode, `No file found at ${filePath}.`);
+    }
+    throw error;
+  }
+  if (linkStat.isSymbolicLink() || !linkStat.isFile()) {
+    throw new TandemError('path_unsafe', `Path must be a regular file, not a link: ${filePath}`);
+  }
+  validateOwnerAndMode(linkStat, filePath);
+  if (linkStat.size <= 0 || linkStat.size > maxBytes) {
+    throw new TandemError('file_size', `File has an invalid size: ${filePath}`);
+  }
+
+  let descriptor;
+  try {
+    const noFollow = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+    const openedStat = fs.fstatSync(descriptor);
+    if (!openedStat.isFile()
+      || openedStat.dev !== linkStat.dev
+      || openedStat.ino !== linkStat.ino) {
+      throw new TandemError('path_changed', `File changed while it was being opened: ${filePath}`);
+    }
+    validateOwnerAndMode(openedStat, filePath);
+    if (openedStat.size <= 0 || openedStat.size > maxBytes) {
+      throw new TandemError('file_size', `File has an invalid size: ${filePath}`);
+    }
+    const buffer = fs.readFileSync(descriptor);
+    if (buffer.length === 0 || buffer.length > maxBytes) {
+      throw new TandemError('file_size', `File changed to an invalid size while being read: ${filePath}`);
+    }
+    return buffer;
+  } catch (error) {
+    if (error?.code === 'ELOOP') {
+      throw new TandemError('path_unsafe', `Refusing to follow a symbolic link: ${filePath}`);
+    }
+    throw error;
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch (_) {}
+    }
+  }
+}
+
+function readSecureJson(filePath, options) {
+  const buffer = readSecureFile(filePath, options);
+  try {
+    const document = JSON.parse(buffer.toString('utf8'));
+    if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('shape');
+    return { buffer, document };
   } catch (_) {
-    throw new TandemError('auth_missing', `No credential found at ${filePath}.`);
+    throw new TandemError('metadata_invalid', `Metadata is not valid JSON: ${filePath}`);
   }
-  if (!stat.isFile()) {
-    throw new TandemError('auth_invalid', 'Credential path is not a regular file.');
+}
+
+function readSecureAuth(filePath) {
+  let buffer;
+  try {
+    buffer = readSecureFile(filePath, { missingCode: 'auth_missing', maxBytes: MAX_AUTH_BYTES });
+  } catch (error) {
+    if (error?.code === 'file_permissions') {
+      throw new TandemError('auth_permissions', `Credential permissions must be 0600: ${filePath}`);
+    }
+    throw error;
   }
-  if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) {
-    throw new TandemError('auth_permissions', `Credential permissions must be 0600: ${filePath}`);
-  }
-  const buffer = fs.readFileSync(filePath);
   validateAuthDocument(buffer);
   return buffer;
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+class OperationLock {
+  constructor(rootDir) {
+    this.rootDir = rootDir;
+    this.lockPath = path.join(rootDir, 'operation.lock');
+    this.ownerPath = path.join(this.lockPath, 'owner.json');
+  }
+
+  reapStaleLock() {
+    let lockStat;
+    try {
+      lockStat = fs.lstatSync(this.lockPath);
+    } catch (error) {
+      return error?.code === 'ENOENT';
+    }
+    if (!lockStat.isDirectory() || lockStat.isSymbolicLink()) {
+      throw new TandemError('lock_unsafe', `Operation lock path is unsafe: ${this.lockPath}`);
+    }
+    validateOwnerAndMode(lockStat, this.lockPath, true);
+
+    let owner;
+    try {
+      owner = readSecureJson(this.ownerPath).document;
+    } catch (error) {
+      if (Date.now() - lockStat.mtimeMs < INCOMPLETE_LOCK_GRACE_MS) return false;
+      owner = null;
+    }
+    if (owner?.hostname && owner.hostname !== os.hostname()) return false;
+    if (owner && processIsAlive(Number(owner.pid))) return false;
+
+    const tombstone = `${this.lockPath}.stale.${process.pid}.${crypto.randomUUID()}`;
+    try {
+      fs.renameSync(this.lockPath, tombstone);
+    } catch (error) {
+      return error?.code === 'ENOENT' ? true : false;
+    }
+    fs.rmSync(tombstone, { recursive: true, force: true });
+    fsyncDirectory(this.rootDir);
+    return true;
+  }
+
+  acquire() {
+    ensurePrivateDirectory(this.rootDir);
+    const token = crypto.randomUUID();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        fs.mkdirSync(this.lockPath, { mode: 0o700 });
+        writeAtomic(this.ownerPath, Buffer.from(`${JSON.stringify({
+          pid: process.pid,
+          hostname: os.hostname(),
+          token,
+          created_at: new Date().toISOString()
+        }, null, 2)}\n`));
+        fsyncDirectory(this.rootDir);
+        return () => this.release(token);
+      } catch (error) {
+        if (error?.code !== 'EEXIST') {
+          try { fs.rmSync(this.lockPath, { recursive: true, force: true }); } catch (_) {}
+          throw error;
+        }
+        if (!this.reapStaleLock()) {
+          throw new TandemError('operation_locked', 'Another Codex Tandem operation is already running.');
+        }
+      }
+    }
+    throw new TandemError('operation_locked', 'Another Codex Tandem operation is already running.');
+  }
+
+  release(token) {
+    let owner;
+    try {
+      owner = readSecureJson(this.ownerPath).document;
+    } catch (_) {
+      throw new TandemError('lock_lost', 'Operation lock ownership could not be verified.');
+    }
+    if (owner.token !== token || Number(owner.pid) !== process.pid) {
+      throw new TandemError('lock_lost', 'Operation lock is no longer owned by this process.');
+    }
+    fs.rmSync(this.lockPath, { recursive: true, force: false });
+    fsyncDirectory(this.rootDir);
+  }
 }
 
 function isAccountFailoverError(error) {
@@ -143,6 +316,7 @@ async function runWithAccountFailover({ runAttempt, profiles }) {
   try {
     return { value: await runAttempt(), failover: null };
   } catch (originalError) {
+    if (typeof profiles.recover === 'function') await profiles.recover();
     const status = profiles.status();
     if (!status.automaticFailoverReady || !isAccountFailoverError(originalError)) {
       throw originalError;
@@ -168,44 +342,90 @@ async function runWithAccountFailover({ runAttempt, profiles }) {
 }
 
 class CodexAccountProfiles {
-  constructor({ rootDir, codexHome, validateLogin }) {
+  constructor({ rootDir, codexHome, validateLogin, faultInjector }) {
     this.rootDir = path.resolve(rootDir);
     this.codexHome = path.resolve(codexHome);
     this.liveAuthPath = path.join(this.codexHome, 'auth.json');
     this.currentPath = path.join(this.rootDir, 'current.json');
     this.journalPath = path.join(this.rootDir, 'switching.json');
     this.validateLogin = typeof validateLogin === 'function' ? validateLogin : async () => {};
+    this.faultInjector = typeof faultInjector === 'function' ? faultInjector : () => {};
     ensurePrivateDirectory(this.rootDir);
     ensurePrivateDirectory(this.codexHome);
-    this.recoverInterruptedSwitch();
+    this.operationLock = new OperationLock(this.rootDir);
   }
 
   profileAuthPath(profile) {
     return path.join(this.rootDir, profileDirectoryName(profile), 'auth.json');
   }
 
-  readCurrent() {
+  readCurrentState() {
     try {
-      return normalizeProfileName(JSON.parse(fs.readFileSync(this.currentPath, 'utf8'))?.current);
-    } catch (_) {
-      return null;
+      const document = readSecureJson(this.currentPath, { missingCode: 'current_missing' }).document;
+      return {
+        current: normalizeProfileName(document.current),
+        transactionId: typeof document.transaction_id === 'string' ? document.transaction_id : null
+      };
+    } catch (error) {
+      if (error?.code === 'current_missing') return null;
+      throw error;
     }
   }
 
-  writeCurrent(profile) {
+  readCurrent() {
+    return this.readCurrentState()?.current || null;
+  }
+
+  writeCurrent(profile, transactionId = crypto.randomUUID()) {
     const current = normalizeProfileName(profile);
     writeAtomic(this.currentPath, Buffer.from(`${JSON.stringify({
       current,
+      transaction_id: transactionId,
       updated_at: new Date().toISOString()
     }, null, 2)}\n`));
+    return transactionId;
   }
 
-  importLiveAs(profile) {
-    const target = normalizeProfileName(profile);
-    const liveAuth = readSecureAuth(this.liveAuthPath);
-    writeAtomic(this.profileAuthPath(target), liveAuth);
-    this.writeCurrent(target);
-    return target;
+  async withOperationLock(callback) {
+    const release = this.operationLock.acquire();
+    let callbackError;
+    try {
+      return await callback();
+    } catch (error) {
+      callbackError = error;
+      throw error;
+    } finally {
+      try {
+        release();
+      } catch (releaseError) {
+        if (!callbackError) throw releaseError;
+      }
+    }
+  }
+
+  async recover() {
+    return this.withOperationLock(() => this.recoverInterruptedSwitchUnlocked());
+  }
+
+  async importLiveAs(profile) {
+    return this.withOperationLock(() => {
+      this.recoverInterruptedSwitchUnlocked();
+      const target = normalizeProfileName(profile);
+      const liveAuth = readSecureAuth(this.liveAuthPath);
+      writeAtomic(this.profileAuthPath(target), liveAuth);
+      this.writeCurrent(target);
+      return target;
+    });
+  }
+
+  async storeProfile(profile, authBuffer) {
+    return this.withOperationLock(() => {
+      this.recoverInterruptedSwitchUnlocked();
+      const target = normalizeProfileName(profile);
+      validateAuthDocument(authBuffer);
+      writeAtomic(this.profileAuthPath(target), authBuffer);
+      return target;
+    });
   }
 
   writeSwitchJournal(from, to) {
@@ -221,14 +441,14 @@ class CodexAccountProfiles {
     fsyncDirectory(this.rootDir);
   }
 
-  recoverInterruptedSwitch() {
-    if (!fs.existsSync(this.journalPath)) return false;
+  recoverInterruptedSwitchUnlocked() {
     let journal;
     try {
-      journal = JSON.parse(fs.readFileSync(this.journalPath, 'utf8'));
+      journal = readSecureJson(this.journalPath, { missingCode: 'journal_missing' }).document;
       journal.from = normalizeProfileName(journal.from);
       journal.to = normalizeProfileName(journal.to);
-    } catch (_) {
+    } catch (error) {
+      if (error?.code === 'journal_missing') return false;
       throw new TandemError('journal_invalid', 'The interrupted switch journal is invalid.');
     }
     writeAtomic(this.liveAuthPath, readSecureAuth(this.profileAuthPath(journal.from)));
@@ -241,8 +461,9 @@ class CodexAccountProfiles {
     try {
       readSecureAuth(this.profileAuthPath(profile));
       return true;
-    } catch (_) {
-      return false;
+    } catch (error) {
+      if (error?.code === 'auth_missing') return false;
+      throw error;
     }
   }
 
@@ -264,58 +485,89 @@ class CodexAccountProfiles {
   }
 
   async switchTo(targetProfile) {
-    const target = normalizeProfileName(targetProfile);
-    const previousProfile = this.readCurrent();
-    if (!previousProfile) {
-      throw new TandemError('not_initialized', 'Run `codex-tandem init A` first.');
-    }
-    if (target === previousProfile) {
-      await this.validateLogin();
-      return { changed: false, from: previousProfile, to: target, rollback: async () => {} };
-    }
-
-    const previousAuth = readSecureAuth(this.liveAuthPath);
-    const targetAuth = readSecureAuth(this.profileAuthPath(target));
-    const previousMarker = fs.readFileSync(this.currentPath);
-
-    // Keep refresh-token changes made by Codex while this profile was active.
-    writeAtomic(this.profileAuthPath(previousProfile), previousAuth);
-    this.writeSwitchJournal(previousProfile, target);
-
-    let liveWasReplaced = false;
-    try {
-      writeAtomic(this.liveAuthPath, targetAuth);
-      liveWasReplaced = true;
-      await this.validateLogin();
-      this.writeCurrent(target);
-      this.clearSwitchJournal();
-    } catch (error) {
-      if (liveWasReplaced) {
-        writeAtomic(this.liveAuthPath, previousAuth);
-        writeAtomic(this.currentPath, previousMarker);
+    return this.withOperationLock(async () => {
+      this.recoverInterruptedSwitchUnlocked();
+      const target = normalizeProfileName(targetProfile);
+      const previousState = this.readCurrentState();
+      const previousProfile = previousState?.current;
+      if (!previousProfile) {
+        throw new TandemError('not_initialized', 'Run `codex-tandem init A` first.');
       }
-      try { this.clearSwitchJournal(); } catch (_) {}
-      if (error instanceof TandemError) throw error;
-      throw new TandemError('validation_failed', 'Target login failed; the original profile was restored.');
-    }
+      if (target === previousProfile) {
+        await this.validateLogin();
+        return { changed: false, from: previousProfile, to: target, rollback: async () => {} };
+      }
 
-    let rolledBack = false;
-    const rollback = async () => {
-      if (rolledBack) return;
-      rolledBack = true;
+      const previousAuth = readSecureAuth(this.liveAuthPath);
+      const targetAuth = readSecureAuth(this.profileAuthPath(target));
+      const previousMarker = readSecureFile(this.currentPath);
+      const switchTransactionId = crypto.randomUUID();
+
+      // Keep refresh-token changes made by Codex while this profile was active.
+      writeAtomic(this.profileAuthPath(previousProfile), previousAuth);
+      this.faultInjector('after_previous_profile_saved');
+      this.writeSwitchJournal(previousProfile, target);
+      this.faultInjector('after_journal');
+
+      let liveWasReplaced = false;
       try {
-        writeAtomic(this.profileAuthPath(target), readSecureAuth(this.liveAuthPath));
-      } catch (_) {}
-      writeAtomic(this.liveAuthPath, previousAuth);
-      writeAtomic(this.currentPath, previousMarker);
-    };
-    return { changed: true, from: previousProfile, to: target, rollback };
+        this.faultInjector('before_live_replace');
+        writeAtomic(this.liveAuthPath, targetAuth);
+        liveWasReplaced = true;
+        this.faultInjector('after_live_replace');
+        try {
+          await this.validateLogin();
+        } catch (validationError) {
+          const failure = new TandemError('validation_failed', 'Target login validation failed.');
+          failure.cause = validationError;
+          throw failure;
+        }
+        this.faultInjector('after_validation');
+        this.writeCurrent(target, switchTransactionId);
+        this.faultInjector('after_current');
+        this.clearSwitchJournal();
+        this.faultInjector('after_journal_clear');
+      } catch (error) {
+        try {
+          if (liveWasReplaced) writeAtomic(this.liveAuthPath, previousAuth);
+          writeAtomic(this.currentPath, previousMarker);
+          this.clearSwitchJournal();
+        } catch (rollbackError) {
+          const failure = new TandemError('rollback_failed', 'Switch failed and the original login could not be restored.');
+          failure.cause = rollbackError;
+          throw failure;
+        }
+        if (error instanceof TandemError) throw error;
+        const failure = new TandemError('switch_failed', 'Switch failed; the original profile was restored.');
+        failure.cause = error;
+        throw failure;
+      }
+
+      let rolledBack = false;
+      const rollback = async () => {
+        if (rolledBack) return;
+        await this.withOperationLock(() => {
+          const activeState = this.readCurrentState();
+          if (activeState?.current !== target || activeState.transactionId !== switchTransactionId) {
+            throw new TandemError('rollback_conflict', 'A later switch occurred; refusing to overwrite it.');
+          }
+          try {
+            writeAtomic(this.profileAuthPath(target), readSecureAuth(this.liveAuthPath));
+          } catch (_) {}
+          writeAtomic(this.liveAuthPath, previousAuth);
+          writeAtomic(this.currentPath, previousMarker);
+          rolledBack = true;
+        });
+      };
+      return { changed: true, from: previousProfile, to: target, rollback };
+    });
   }
 }
 
 module.exports = {
   CodexAccountProfiles,
   PROFILE_NAMES,
+  OperationLock,
   TandemError,
   isAccountFailoverError,
   normalizeProfileName,

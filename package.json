@@ -1,6 +1,6 @@
 {
   "name": "codex-tandem",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Two-account credential switching for Codex CLI without moving sessions or configuration.",
   "license": "MIT",
   "type": "commonjs",
